@@ -1,0 +1,211 @@
+name: Orlando RustDesk Windows OTP smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  SOURCE_RUN_ID: "29585173573"
+  SOURCE_ARTIFACT_NAME: Orlando-RustDesk-1.4.9-windows-x64-portable-unsigned
+  SOURCE_EXE_NAME: Orlando-RustDesk-1.4.9-windows-x64-portable.exe
+  SOURCE_EXE_SHA256: "94be3b76faec8011c86429bf5d46185b51fabc9e00442866d22742c15430c1b5"
+
+jobs:
+  otp-smoke:
+    name: Exercise live temporary-password IPC
+    runs-on: windows-2022
+    timeout-minutes: 12
+    steps:
+      - name: Download the existing unsigned portable EXE
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          repository: globel420/rustdesk
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          name: ${{ env.SOURCE_ARTIFACT_NAME }}
+          path: ${{ runner.temp }}\orlando-otp-smoke\artifact
+          github-token: ${{ github.token }}
+
+      - name: Verify and prepare the local-only portable EXE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $artifactDirectory = Join-Path $env:RUNNER_TEMP "orlando-otp-smoke\artifact"
+          $source = Join-Path $artifactDirectory $env:SOURCE_EXE_NAME
+          if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "The expected portable EXE is missing from the pinned artifact."
+          }
+          $executables = @(Get-ChildItem -LiteralPath $artifactDirectory -Filter "*.exe" -File)
+          if ($executables.Count -ne 1) {
+            throw "The pinned artifact must contain exactly one EXE."
+          }
+          $actualHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -cne $env:SOURCE_EXE_SHA256) {
+            throw "The portable EXE checksum does not match the pinned build output."
+          }
+
+          # The SFX wrapper passes its own filename to the inner RustDesk process as
+          # RUSTDESK_APPNAME. This encoded filename confines rendezvous to localhost
+          # and supplies a non-production dummy key for both launch and CLI queries.
+          $localOnlyName = "rustdesk-host=127.0.0.1,key=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=,.exe"
+          $portable = Join-Path $artifactDirectory $localOnlyName
+          Move-Item -LiteralPath $source -Destination $portable
+          "OTP_SMOKE_PORTABLE=$portable" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Start RustDesk and exercise live OTP IPC
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $portable = Get-Item -LiteralPath $env:OTP_SMOKE_PORTABLE
+          $extractRoot = Join-Path $env:LOCALAPPDATA "rustdesk"
+          $configRoot = Join-Path $env:APPDATA "RustDesk"
+          $extractRootExisted = Test-Path -LiteralPath $extractRoot
+          $configRootExisted = Test-Path -LiteralPath $configRoot
+          $stdout = Join-Path $env:RUNNER_TEMP "orlando-otp-smoke\otp.stdout"
+          $stderr = Join-Path $env:RUNNER_TEMP "orlando-otp-smoke\otp.stderr"
+          $rootProcessIds = @{}
+          $ownedProcesses = @{}
+          $smokeFailure = $null
+
+          function Remember-SmokeProcessTree {
+            $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+            foreach ($process in $all) {
+              $processId = [int]$process.ProcessId
+              if ($rootProcessIds.ContainsKey($processId)) {
+                $ownedProcesses[$processId] = [string]$process.CreationDate
+              }
+            }
+            $changed = $true
+            while ($changed) {
+              $changed = $false
+              foreach ($process in $all) {
+                $processId = [int]$process.ProcessId
+                $parentId = [int]$process.ParentProcessId
+                if (($rootProcessIds.ContainsKey($parentId) -or $ownedProcesses.ContainsKey($parentId)) -and
+                    -not $ownedProcesses.ContainsKey($processId)) {
+                  $ownedProcesses[$processId] = [string]$process.CreationDate
+                  $changed = $true
+                }
+              }
+            }
+          }
+
+          function Test-ValidPasswordBytes([byte[]]$bytes) {
+            if ($bytes.Length -lt 7 -or $bytes.Length -gt 18 -or $bytes[-1] -ne 10) {
+              return $false
+            }
+            $payloadLength = $bytes.Length - 1
+            if ($payloadLength -gt 0 -and $bytes[$payloadLength - 1] -eq 13) {
+              $payloadLength--
+            }
+            if ($payloadLength -lt 6 -or $payloadLength -gt 16) {
+              return $false
+            }
+            for ($index = 0; $index -lt $payloadLength; $index++) {
+              $value = $bytes[$index]
+              $isAsciiAlphaNumeric =
+                ($value -ge 48 -and $value -le 57) -or
+                ($value -ge 65 -and $value -le 90) -or
+                ($value -ge 97 -and $value -le 122)
+              if (-not $isAsciiAlphaNumeric) {
+                return $false
+              }
+            }
+            return $true
+          }
+
+          try {
+            $preExistingProcesses = @(
+              Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                Where-Object { ([string]$_.Name).StartsWith("rustdesk", [System.StringComparison]::OrdinalIgnoreCase) }
+            )
+            if ($extractRootExisted -or $configRootExisted -or $preExistingProcesses.Count -ne 0) {
+              throw "The hosted runner has pre-existing RustDesk state; refusing an ambiguous IPC test."
+            }
+
+            # The wrapper also sets this value on its child. Setting it here makes
+            # the intended local-only process identity explicit at the job boundary.
+            $env:RUSTDESK_APPNAME = $portable.Name
+            $launcher = Start-Process -FilePath $portable.FullName -PassThru
+            $rootProcessIds[[int]$launcher.Id] = $true
+            if (-not $launcher.WaitForExit(30000)) {
+              throw "The portable wrapper did not finish extraction and launch in time."
+            }
+            if ($launcher.ExitCode -ne 0) {
+              throw "The portable wrapper failed to launch RustDesk."
+            }
+            Remember-SmokeProcessTree
+
+            $deadline = (Get-Date).AddSeconds(75)
+            $passed = $false
+            while ((Get-Date) -lt $deadline) {
+              Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
+              $query = Start-Process `
+                -FilePath $portable.FullName `
+                -ArgumentList "--get-temporary-password" `
+                -Wait `
+                -PassThru `
+                -RedirectStandardOutput $stdout `
+                -RedirectStandardError $stderr
+              $rootProcessIds[[int]$query.Id] = $true
+              Remember-SmokeProcessTree
+
+              $bytes = if (Test-Path -LiteralPath $stdout) {
+                [System.IO.File]::ReadAllBytes($stdout)
+              } else {
+                [byte[]]@()
+              }
+              if ($query.ExitCode -eq 0) {
+                if (-not (Test-ValidPasswordBytes $bytes)) {
+                  throw "The OTP command succeeded but returned an invalid machine-readable payload."
+                }
+                $passed = $true
+                break
+              }
+              if ($bytes.Length -ne 0) {
+                throw "A failed OTP query unexpectedly wrote data to stdout."
+              }
+              Start-Sleep -Seconds 2
+            }
+            if (-not $passed) {
+              throw "RustDesk main IPC did not return a temporary password before timeout."
+            }
+            Write-Host "Live temporary-password IPC smoke passed; the password was not printed."
+          } catch {
+            $smokeFailure = $_
+          } finally {
+            Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
+            Remember-SmokeProcessTree
+
+            if (-not $extractRootExisted) {
+              # Also capture any process launched from the fresh SFX extraction root.
+              foreach ($process in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
+                $path = [string]$process.ExecutablePath
+                if ($path.StartsWith($extractRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+                  $ownedProcesses[[int]$process.ProcessId] = [string]$process.CreationDate
+                }
+              }
+            }
+
+            foreach ($entry in @($ownedProcesses.GetEnumerator())) {
+              $processId = [int]$entry.Key
+              $current = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
+              if ($null -ne $current -and [string]$current.CreationDate -ceq [string]$entry.Value) {
+                Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+              }
+            }
+            Start-Sleep -Seconds 1
+            if (-not $extractRootExisted) {
+              Remove-Item -LiteralPath $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            if (-not $configRootExisted) {
+              Remove-Item -LiteralPath $configRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            Remove-Item -LiteralPath (Split-Path -Parent $portable.DirectoryName) -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+          if ($null -ne $smokeFailure) {
+            throw $smokeFailure
+          }
