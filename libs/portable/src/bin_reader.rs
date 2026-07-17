@@ -42,7 +42,7 @@ impl BinaryData {
         buf
     }
 
-    pub fn write_to_file(&self, prefix: &Path) {
+    pub fn write_to_file(&self, prefix: &Path, quiet: bool) {
         let p = prefix.join(&self.path);
         if let Some(parent) = p.parent() {
             if !parent.exists() {
@@ -56,11 +56,15 @@ impl BinaryData {
             let md5_record = String::from_utf8_lossy(self.md5_code);
             if digest == md5_record {
                 // same, skip this file
-                println!("skip {}", &self.path);
+                if !quiet {
+                    println!("skip {}", &self.path);
+                }
                 return;
             } else {
-                println!("writing {}", p.display());
-                println!("{} -> {}", md5_record, digest)
+                if !quiet {
+                    println!("writing {}", p.display());
+                    println!("{} -> {}", md5_record, digest)
+                }
             }
         }
         let _ = fs::write(p, self.decompress());

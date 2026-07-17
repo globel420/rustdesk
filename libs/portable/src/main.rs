@@ -66,6 +66,7 @@ fn setup(
     _args: &Vec<String>,
     _ui: &mut bool,
 ) -> Option<PathBuf> {
+    let quiet = cfg!(windows) && is_get_temporary_password_cli(_args);
     let dir = if let Some(dir) = dir {
         dir
     } else {
@@ -88,7 +89,7 @@ fn setup(
         std::fs::remove_dir_all(&dir).ok();
     }
     for file in reader.files.iter() {
-        file.write_to_file(&dir);
+        file.write_to_file(&dir, quiet);
     }
     write_meta(&dir, ts);
     #[cfg(windows)]
@@ -132,8 +133,15 @@ fn is_windows_7() -> bool {
     false
 }
 
+fn is_get_temporary_password_cli(args: &[String]) -> bool {
+    args.len() == 1 && args[0] == "--get-temporary-password"
+}
+
 fn execute(path: PathBuf, args: Vec<String>, _ui: bool) {
-    println!("executing {}", path.display());
+    let get_temporary_password_cli = cfg!(windows) && is_get_temporary_password_cli(&args);
+    if !get_temporary_password_cli {
+        println!("executing {}", path.display());
+    }
     // setup env
     let exe = std::env::current_exe().unwrap_or_default();
     let exe_name = exe.file_name().unwrap_or_default();
@@ -150,6 +158,18 @@ fn execute(path: PathBuf, args: Vec<String>, _ui: bool) {
     }
 
     cmd.env(APPNAME_RUNTIME_ENV_KEY, exe_name);
+    if get_temporary_password_cli {
+        // Keep this CLI machine-readable and propagate the inner RustDesk exit status.
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::null());
+        let code = cmd
+            .status()
+            .ok()
+            .and_then(|status| status.code())
+            .unwrap_or(1);
+        std::process::exit(code);
+    }
     if use_null_stdio() {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -186,6 +206,7 @@ fn main() {
         }
         i += 1;
     }
+    let get_temporary_password_cli = cfg!(windows) && is_get_temporary_password_cli(&args);
     let click_setup = args.is_empty() && arg_exe.to_lowercase().ends_with("install.exe");
     #[cfg(windows)]
     let quick_support = args.is_empty() && win::is_quick_support_exe(&arg_exe);
@@ -207,6 +228,25 @@ fn main() {
             args = vec!["--quick_support".to_owned()];
         }
         execute(exe, args, ui);
+    } else if get_temporary_password_cli {
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temporary_password_cli_requires_exactly_one_argument() {
+        assert!(is_get_temporary_password_cli(&[
+            "--get-temporary-password".to_owned()
+        ]));
+        assert!(!is_get_temporary_password_cli(&[]));
+        assert!(!is_get_temporary_password_cli(&[
+            "--get-temporary-password".to_owned(),
+            "unexpected".to_owned()
+        ]));
     }
 }
 

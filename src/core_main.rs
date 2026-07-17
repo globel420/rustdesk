@@ -10,6 +10,45 @@ use hbb_common::{config, log};
 #[cfg(windows)]
 use tauri_winrt_notification::{Duration, Sound, Toast};
 
+#[cfg(any(windows, test))]
+fn require_nonempty_temporary_password(value: Option<String>) -> Result<String, ()> {
+    match value {
+        Some(password) if !password.is_empty() => Ok(password),
+        _ => Err(()),
+    }
+}
+
+#[cfg(windows)]
+fn run_get_temporary_password_cli(args: &[String]) -> ! {
+    use std::io::Write;
+
+    const EXIT_FAILURE: i32 = 1;
+    const EXIT_USAGE: i32 = 2;
+
+    if args.len() != 1 {
+        std::process::exit(EXIT_USAGE);
+    }
+
+    // Keep stdout machine-readable and do not write IPC details or the password to a log.
+    let password = match crate::ipc::get_config("temporary-password") {
+        Ok(value) => match require_nonempty_temporary_password(value) {
+            Ok(password) => password,
+            Err(()) => std::process::exit(EXIT_FAILURE),
+        },
+        Err(_) => std::process::exit(EXIT_FAILURE),
+    };
+
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    if writeln!(stdout, "{password}")
+        .and_then(|_| stdout.flush())
+        .is_err()
+    {
+        std::process::exit(EXIT_FAILURE);
+    }
+    std::process::exit(0);
+}
+
 #[macro_export]
 macro_rules! my_println{
     ($($arg:tt)*) => {
@@ -78,6 +117,10 @@ pub fn core_main() -> Option<Vec<String>> {
             }
         }
         i += 1;
+    }
+    #[cfg(windows)]
+    if args.first().map(String::as_str) == Some("--get-temporary-password") {
+        run_get_temporary_password_cli(&args);
     }
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     if args.is_empty() {
@@ -981,6 +1024,19 @@ mod tests {
         ] {
             assert!(!is_user_main_ipc_scope_cli_command(&args(&[command])));
         }
+    }
+
+    #[test]
+    fn temporary_password_cli_requires_a_nonempty_value() {
+        assert_eq!(
+            require_nonempty_temporary_password(Some("secret123".to_owned())),
+            Ok("secret123".to_owned())
+        );
+        assert_eq!(
+            require_nonempty_temporary_password(Some(String::new())),
+            Err(())
+        );
+        assert_eq!(require_nonempty_temporary_password(None), Err(()));
     }
 }
 
